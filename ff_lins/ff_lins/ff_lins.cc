@@ -1,5 +1,5 @@
 /*
- * FF-LINS: A Consistent Frame-to-Frame Solid-State-LiDAR-Inertial State Estimator 
+ * FF-LINS: A Consistent Frame-to-Frame Solid-State-LiDAR-Inertial State Estimator
  *
  * Copyright (C) 2023 i2Nav Group, Wuhan University
  *
@@ -117,40 +117,8 @@ LINS::LINS(const string &configfile, const string &outputpath, lidar::LidarViewe
 }
 
 bool LINS::addNewImu(const IMU &imu) {
-    static IMU last_imu{0};
     if (imu_buffer_mutex_.try_lock()) {
-        double dt = imu.time - last_imu.time;
-        if ((dt > imudatadt_ * 1.5) && (last_imu.time != 0)) {
-            LOGE << absl::StrFormat("Lost IMU data at %0.3lf with dt %0.3lf", imu.time, dt);
-
-            long cnts = lround(dt / imudatadt_) - 1;
-
-            IMU imudata;
-            imudata.time = last_imu.time;
-            while (cnts--) {
-                imudata.time += imudatadt_;
-                imudata.dt = imudatadt_;
-
-                // 等效于速率内插
-                double scale   = (imudata.time - last_imu.time) / (imu.time - last_imu.time);
-                imudata.dtheta = last_imu.dtheta + scale * (imu.dtheta - last_imu.dtheta);
-                imudata.dvel   = last_imu.dvel + scale * (imu.dvel - last_imu.dvel);
-
-                imu_buffer_.push(imudata);
-                LOGE << absl::StrFormat("Append extra IMU data at %0.3lf", imudata.time);
-            }
-
-            // 当前IMU历元
-            imudata.dt     = imu.time - imudata.time;
-            imudata.time   = imu.time;
-            imudata.dtheta = imu.dtheta / imu.dt * imudata.dt;
-            imudata.dvel   = imu.dvel / imu.dt * imudata.dt;
-            LOGE << absl::StrFormat("Add current IMU data at %0.3lf", imudata.time);
-        } else {
-            imu_buffer_.push(imu);
-        }
-        last_imu = imu;
-
+        imu_buffer_.push(imu);
         imu_buffer_mutex_.unlock();
         return true;
     }
@@ -203,6 +171,7 @@ void LINS::runFusion() {
     double last_update_time = 0;
 
     PointCloudPtr map_pointcloud = PointCloudPtr(new PointCloud);
+    std::atomic<bool> is_fusing_{false};
 
     LOGI << "Fusion thread is started";
     while (!is_finished_) {
@@ -231,6 +200,11 @@ void LINS::runFusion() {
         if (lidar_frame_buffer_.size() > reserved_buffer_counts_) {
             LOGI << "Buffer size: " << lidar_frame_buffer_.size();
         }
+
+        while (is_fusing_) {
+            usleep(WAITING_DELAY_IN_US);
+        }
+        is_fusing_ = true;
 
         // 融合状态
         if (linsstate_ == LINS_INITIALIZING) {
@@ -295,20 +269,26 @@ void LINS::runFusion() {
 
             // 可视化
             if (is_use_visualization_) {
-                task_group_.run([this, &map_pointcloud]() {
+                task_group_.run([this, &map_pointcloud, &is_fusing_]() {
                     // 更新点云地图
                     lidar_map_->addNewPointCloudToMap(map_pointcloud);
 
                     // 可视化
                     auto frame = lidar_map_->keyframes().back();
                     linsLidarVisualization(frame, map_pointcloud);
+
+                    is_fusing_ = false;
                 });
             } else {
-                task_group_.run([this, &map_pointcloud]() {
+                task_group_.run([this, &map_pointcloud, &is_fusing_]() {
                     // 更新点云地图
                     lidar_map_->addNewPointCloudToMap(map_pointcloud);
+                    is_fusing_ = false;
                 });
             }
+        } else {
+
+            is_fusing_ = false;
         }
 
     } // while
@@ -404,7 +384,7 @@ bool LINS::waitImuAddToInsWindow(double time) {
 }
 
 bool LINS::waitImuDoInsMechanization(double time) {
-    double end_time = time + imudatadt_ * 2;
+    double end_time = time + imudatadt_ * 5;
 
     // 等待IMU数据
     waitImuData(end_time);
